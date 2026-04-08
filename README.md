@@ -115,7 +115,7 @@ ros2 launch my_catheter my_catheter_launch.py
 ```
 
 Apply a force to any catheter link in Gazebo to observe spring-driven deformation propagated across all three visualization tools.
-> Reference: [NAMIC Project Week 43  Robotic Catheter Placement for Cardiac Ablation](https://projectweek.na-mic.org/PW43_2025_Montreal/Projects/ApplicationOfSlicerros2InRoboticCatheterPlacementForCardiacAblation/)
+> Reference: [NAMIC PW43: Robotic Catheter Placement for Cardiac Ablation](https://projectweek.na-mic.org/PW43_2025_Montreal/Projects/ApplicationOfSlicerros2InRoboticCatheterPlacementForCardiacAblation/)
 
 ---
 
