@@ -2,11 +2,11 @@
 
 A ROS2-based simulation framework for flexible catheter navigation in anatomical environments. The catheter is modeled as a serial-link chain with spring-damper universal joints, integrated with **Gazebo Harmonic** for physics simulation, **RViz2** for robot visualization, and **3D Slicer (SlicerROS2)** for intraoperative AR navigation.
 
-Two generator scripts are provided:
-- **`catheter_urdf_generator.py`** — passive deformation simulation (observe catheter deflection under external forces)
-- **`cath_urdf_generator_with_controller.py`** — active control simulation with a 4-DOF motorized base and keyboard teleoperation
+A single generator script `catheter_generator.py` supports two modes:
+- **Passive mode** (default) — passive deformation simulation (observe catheter deflection under external forces)
+- **Active mode** (`--controller`) — active control simulation with a 4-DOF motorized base and keyboard teleoperation
 
-Both scripts optionally accept an anatomy STL file (`--anatomy-stl`) so the anatomical model is automatically visible in **both Gazebo and RViz** at a specified pose, with no manual placement required.
+The script optionally accepts an anatomy STL file (`--anatomy-stl`) so the anatomical model is automatically visible in **both Gazebo and RViz** at a specified pose, with no manual placement required.
 
 ---
 
@@ -35,8 +35,7 @@ Both scripts optionally accept an anatomy STL file (`--anatomy-stl`) so the anat
 ├── README.md
 ├── docs/
 │   └── images/                                 # Screenshots for README
-├── catheter_urdf_generator.py                  # Passive simulation generator
-├── cath_urdf_generator_with_controller.py      # Active control simulation generator
+├── catheter_generator.py                       # Unified generator (passive + active modes)
 └── test_anatomy/                               # Example anatomical model (aortic arch)
     ├── meshes/                                 # Mesh files (.stl)
     ├── model.config                            # Gazebo model metadata
@@ -102,7 +101,7 @@ Simulates catheter deformation under externally applied forces. The deflection i
 
 ```bash
 cd ~/ros2_ws/src
-python3 catheter_urdf_generator.py \
+python3 catheter_generator.py \
     --N 12 --D 0.003 --L1 0.20 --L2 0.5 --L3 0.05 \
     --K 0.2 --M 0.5 --output my_catheter
 ```
@@ -110,7 +109,7 @@ python3 catheter_urdf_generator.py \
 To include the aortic anatomy model at a specified pose:
 
 ```bash
-python3 catheter_urdf_generator.py \
+python3 catheter_generator.py \
     --N 12 --D 0.003 --L1 0.20 --L2 0.5 --L3 0.05 \
     --K 0.2 --M 0.5 --output my_catheter \
     --anatomy-stl /path/to/test_anatomy/meshes/Aortic_NIH3D_v2.stl \
@@ -140,7 +139,7 @@ Extends the passive simulation with a **4-DOF actuated base** (X/Y translation, 
 
 ```bash
 cd ~/ros2_ws/src
-python3 cath_urdf_generator_with_controller.py \
+python3 catheter_generator.py --controller \
     --N 50 --D 0.003 --L1 0.04 --L2 0.5 --L3 0.01 \
     --K 10.0 --Kd 0.1 --Kf 0.01 --M 0.5 \
     --output control_catheter_test
@@ -149,7 +148,7 @@ python3 cath_urdf_generator_with_controller.py \
 To include the aortic anatomy model:
 
 ```bash
-python3 cath_urdf_generator_with_controller.py \
+python3 catheter_generator.py --controller \
     --N 50 --D 0.003 --L1 0.04 --L2 0.5 --L3 0.01 \
     --K 10.0 --Kd 0.1 --Kf 0.01 --M 0.5 \
     --output control_catheter_test \
@@ -198,10 +197,10 @@ The teleop node publishes to the following ROS2 topics:
 
 ### Automated (recommended)
 
-Pass `--anatomy-stl` to either generator script. The STL is copied into the package's `meshes/` directory and the anatomy is registered in both the URDF and the Gazebo world file — so it appears in **RViz and Gazebo automatically** at the pose you specify, with no manual drag-and-drop required.
+Pass `--anatomy-stl` to `catheter_generator.py`. The STL is copied into the package's `meshes/` directory and the anatomy is registered in both the URDF and the Gazebo world file — so it appears in **RViz and Gazebo automatically** at the pose you specify, with no manual drag-and-drop required.
 
 ```bash
-python3 catheter_urdf_generator.py \
+python3 catheter_generator.py \
     --output my_catheter \
     --anatomy-stl test_anatomy/meshes/Aortic_NIH3D_v2.stl \
     --anatomy-x 0.0 --anatomy-y -0.02 --anatomy-z 0.56 \
