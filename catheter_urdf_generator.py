@@ -645,6 +645,29 @@ def generate_launch_description():
             <specular>0.1 0.1 0.1 1</specular>
           </material>
         </visual>
+        <collision name="collision">
+          <geometry>
+            <mesh>
+              <uri>file://__ANATOMY_MESH_PATH__</uri>
+              <scale>{sc} {sc} {sc}</scale>
+            </mesh>
+          </geometry>
+          <surface>
+            <contact>
+              <collide_bitmask>0x01</collide_bitmask>
+              <ode>
+                <min_depth>0.001</min_depth>
+                <max_vel>0.1</max_vel>
+              </ode>
+            </contact>
+            <friction>
+              <ode>
+                <mu>0.1</mu>
+                <mu2>0.1</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
       </link>
     </model>'''
 
