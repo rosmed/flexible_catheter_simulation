@@ -1053,28 +1053,37 @@ ament_package()'''
         # on /tf (not /tf_static) at 10 Hz with current timestamps.
         # Dynamic /tf entries have current timestamps which always take
         # precedence over RSP's /tf_static entry (timestamp = 0).
+        #
+        # IMPORTANT: LaunchConfiguration resolves to a *string* (e.g. '0.3').
+        # Passing it directly as a Node parameter would cause a DOUBLE/STRING
+        # type mismatch in rclpy, silently falling back to the default 0.0.
+        # We therefore use OpaqueFunction to resolve the values as Python
+        # floats *before* creating the Node, so the parameters dict contains
+        # actual float values that match the declared DOUBLE type.
         if not self.with_controller:
             initial_pose_tf_block = f'''
     # ── Initial pose: world → base_link dynamic TF ──────────────────────────
-    # The URDF fixes world_to_base at origin; this broadcaster continuously
-    # publishes the real initial offset on /tf with current timestamps, which
-    # overrides the static entry and keeps RViz aligned with Gazebo.
-    pose_broadcaster = Node(
-        package='{package_name}',
-        executable='catheter_pose_broadcaster.py',
-        name='catheter_pose_broadcaster',
-        parameters=[{{
-            'x':     LaunchConfiguration('initial_x'),
-            'y':     LaunchConfiguration('initial_y'),
-            'z':     LaunchConfiguration('initial_z'),
-            'roll':  LaunchConfiguration('initial_roll'),
-            'pitch': LaunchConfiguration('initial_pitch'),
-            'yaw':   LaunchConfiguration('initial_yaw'),
-        }}],
-        output='screen',
-    )
+    # OpaqueFunction resolves the launch args as Python floats so the
+    # broadcaster receives DOUBLE parameters (not strings).
+    def _launch_broadcaster(context):
+        x     = float(LaunchConfiguration('initial_x').perform(context))
+        y     = float(LaunchConfiguration('initial_y').perform(context))
+        z     = float(LaunchConfiguration('initial_z').perform(context))
+        roll  = float(LaunchConfiguration('initial_roll').perform(context))
+        pitch = float(LaunchConfiguration('initial_pitch').perform(context))
+        yaw   = float(LaunchConfiguration('initial_yaw').perform(context))
+        return [Node(
+            package='{package_name}',
+            executable='catheter_pose_broadcaster.py',
+            name='catheter_pose_broadcaster',
+            parameters=[{{'x': x, 'y': y, 'z': z,
+                          'roll': roll, 'pitch': pitch, 'yaw': yaw}}],
+            output='screen',
+        )]
+
+    pose_broadcaster_action = OpaqueFunction(function=_launch_broadcaster)
 '''
-            ld_initial_pose_entry = '        pose_broadcaster,'
+            ld_initial_pose_entry = '        pose_broadcaster_action,'
         else:
             initial_pose_tf_block = ''
             ld_initial_pose_entry = ''
