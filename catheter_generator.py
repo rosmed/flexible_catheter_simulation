@@ -995,11 +995,9 @@ ament_package()'''
             '/model/{package_name}_model/pose@geometry_msgs/msg/PoseStamped[gz.msgs.Pose',
             '/world/catheter_world/model/{package_name}_model/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model','''
 
-        # Gazebo launch: OpaqueFunction when anatomy models are present so that
-        # installed mesh paths (which include the colcon install prefix) can be
-        # resolved at launch time rather than at generation time.
+        # Gazebo launch: always use OpaqueFunction so that anatomy mesh paths
+        # and the world SDF can be resolved at launch time.
         if self.anatomy_models:
-            # Build one replace() call per model using indexed placeholders.
             replace_lines = '\n'.join(
                 f"        content = content.replace("
                 f"'__ANATOMY_MESH_PATH_{i}__', "
@@ -1027,7 +1025,6 @@ ament_package()'''
         )]
 
     gazebo_action = OpaqueFunction(function=_launch_gazebo)'''
-            extra_imports = '\nfrom launch.actions import IncludeLaunchDescription, OpaqueFunction'
         else:
             gazebo_block = f'''
     custom_world_file = os.path.join(pkg_share, 'worlds', 'custom_world.sdf')
@@ -1037,34 +1034,63 @@ ament_package()'''
         ),
         launch_arguments={{'gz_args': f'-r {{custom_world_file}}'}}.items(),
     )'''
-            extra_imports = '\nfrom launch.actions import IncludeLaunchDescription'
 
         launch_content = f'''import os
 
 from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription{extra_imports}
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import xacro
 
 
 def generate_launch_description():
 
-    pkg_share     = get_package_share_directory('{package_name}')
+    pkg_share      = get_package_share_directory('{package_name}')
     pkg_ros_gz_sim = get_package_share_directory('ros_gz_sim')
 
-    robot_description_file   = os.path.join(pkg_share, 'urdf', '{xacro_filename}')
-    robot_description_config = xacro.process_file(robot_description_file)
-    robot_description = {{'robot_description': robot_description_config.toxml()}}
+    robot_description_file = os.path.join(pkg_share, 'urdf', '{xacro_filename}')
 
-    # Publishes TF for the catheter and the anatomy model (when configured)
-    robot_state_publisher = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='both',
-        parameters=[robot_description],
-    )
+    # ── Initial catheter pose ────────────────────────────────────────────────
+    # Override at launch time:
+    #   ros2 launch {package_name} {package_name}_launch.py initial_z:=0.3
+    pose_args = [
+        DeclareLaunchArgument('initial_x',     default_value='0.0',
+                              description='Catheter initial X position (m)'),
+        DeclareLaunchArgument('initial_y',     default_value='0.0',
+                              description='Catheter initial Y position (m)'),
+        DeclareLaunchArgument('initial_z',     default_value='0.0',
+                              description='Catheter initial Z position (m)'),
+        DeclareLaunchArgument('initial_roll',  default_value='0.0',
+                              description='Catheter initial roll  (rad)'),
+        DeclareLaunchArgument('initial_pitch', default_value='0.0',
+                              description='Catheter initial pitch (rad)'),
+        DeclareLaunchArgument('initial_yaw',   default_value='0.0',
+                              description='Catheter initial yaw   (rad)'),
+    ]
+
+    def _robot_state_publisher(context):
+        """Process Xacro with the launch-time initial pose and start RSP."""
+        mappings = {{
+            'initial_x':     LaunchConfiguration('initial_x').perform(context),
+            'initial_y':     LaunchConfiguration('initial_y').perform(context),
+            'initial_z':     LaunchConfiguration('initial_z').perform(context),
+            'initial_roll':  LaunchConfiguration('initial_roll').perform(context),
+            'initial_pitch': LaunchConfiguration('initial_pitch').perform(context),
+            'initial_yaw':   LaunchConfiguration('initial_yaw').perform(context),
+        }}
+        config = xacro.process_file(robot_description_file, mappings=mappings)
+        return [Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            output='both',
+            parameters=[{{'robot_description': config.toxml()}}],
+        )]
+
+    rsp_action = OpaqueFunction(function=_robot_state_publisher)
 
     rviz = Node(
         package='rviz2',
@@ -1076,8 +1102,16 @@ def generate_launch_description():
     spawn = Node(
         package='ros_gz_sim',
         executable='create',
-        parameters=[{{'name': '{package_name}_model',
-                    'file': os.path.join(pkg_share, 'sdf', '{sdf_filename}')}}],
+        parameters=[{{
+            'name':  '{package_name}_model',
+            'file':  os.path.join(pkg_share, 'sdf', '{sdf_filename}'),
+            'x':     LaunchConfiguration('initial_x'),
+            'y':     LaunchConfiguration('initial_y'),
+            'z':     LaunchConfiguration('initial_z'),
+            'roll':  LaunchConfiguration('initial_roll'),
+            'pitch': LaunchConfiguration('initial_pitch'),
+            'yaw':   LaunchConfiguration('initial_yaw'),
+        }}],
         output='screen',
     )
 
@@ -1095,10 +1129,11 @@ def generate_launch_description():
 {gazebo_block}
 
     return LaunchDescription([
+        *pose_args,
         gazebo_action,
         spawn,
         bridge,
-        robot_state_publisher,
+        rsp_action,
         rviz,
     ])
 '''
@@ -1194,6 +1229,14 @@ def generate_launch_description():
         robot = ET.Element('robot', name='flexible_catheter')
         robot.set('xmlns:xacro', 'http://www.ros.org/wiki/xacro')
 
+        # Initial-pose arguments — settable at launch time via xacro mappings.
+        # Passive mode uses them in the world_to_base fixed joint.
+        # Controller mode declares them for consistency but the prismatic joints
+        # control position instead; use the Gazebo spawn pose for offset.
+        for arg in ('initial_x', 'initial_y', 'initial_z',
+                    'initial_roll', 'initial_pitch', 'initial_yaw'):
+            ET.SubElement(robot, 'xacro:arg', name=arg, default='0.0')
+
         self.generate_cylinder_stl(self.radius, self.L3,                   'tip_link.stl')
         self.generate_cylinder_stl(self.radius, self.L1,                   'base_link.stl')
         self.generate_cylinder_stl(self.radius, self.bending_link_length,  'bending_link.stl')
@@ -1267,7 +1310,9 @@ def generate_launch_description():
             j_world = ET.SubElement(robot, 'joint', name='world_to_base', type='fixed')
             ET.SubElement(j_world, 'parent', link='world')
             ET.SubElement(j_world, 'child',  link='base_link')
-            ET.SubElement(j_world, 'origin', xyz='0 0 0', rpy='0 0 0')
+            ET.SubElement(j_world, 'origin',
+                          xyz='$(arg initial_x) $(arg initial_y) $(arg initial_z)',
+                          rpy='$(arg initial_roll) $(arg initial_pitch) $(arg initial_yaw)')
 
         # Flexible catheter joints
         if self.bending_links > 0:
