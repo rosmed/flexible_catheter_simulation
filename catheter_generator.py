@@ -19,12 +19,27 @@ Passive mode (observe deformation under external forces):
 Active mode (4-DOF motorized base + keyboard teleoperation):
   python3 catheter_generator.py --output my_catheter --controller
 
-With anatomy model visible in both RViz and Gazebo:
+With a single anatomy STL visible in both RViz and Gazebo:
   python3 catheter_generator.py --output my_catheter \\
       --anatomy-stl path/to/anatomy.stl \\
       --anatomy-x 0.0 --anatomy-y -0.02 --anatomy-z 0.56
+
+With multiple anatomy models loaded from a 3D Slicer MRML scene file:
+  python3 catheter_generator.py --output my_catheter \\
+      --slicer-scene path/to/Scene.mrml
+
+  All vtkMRMLModelNode entries in the scene are imported.  If a model is
+  parented to a vtkMRMLLinearTransformNode the transform (including nested
+  chains) is applied automatically.
+
+  Coordinate handling: SlicerROS2 maps ROS ↔ Slicer RAS directly (no flip).
+  LPS-stored meshes (DICOM default) have X and Y negated automatically.
+  Mesh files must be co-located with the .mrml file.  STL is preferred;
+  the parser also accepts VTK polydata files with the .vtk extension if an
+  STL counterpart is absent.
 """
 
+import re
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
 import math
@@ -34,12 +49,210 @@ import os
 import struct
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3D Slicer MRML scene parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_slicer_scene(mrml_path, scale=0.001):
+    """Parse a 3D Slicer MRML scene file and return anatomy model descriptors.
+
+    Handles vtkMRMLModelNode, vtkMRMLModelStorageNode, vtkMRMLModelDisplayNode,
+    and vtkMRMLLinearTransformNode elements.  Nested (chained) linear transforms
+    are composed automatically.
+
+    Coordinate conventions
+    ----------------------
+    SlicerROS2 maps the ROS world frame directly onto Slicer's RAS frame
+    (R=+X, A=+Y, S=+Z), with no axis flip.  Transforms stored in the MRML
+    file are already in RAS, so they are applied to the ROS world as-is
+    (translation units are scaled from mm to metres).
+
+    Mesh files whose storage node declares ``coordinateSystem="LPS"`` are
+    stored with axes L=+X, P=+Y, S=+Z — rotated 180° about Z relative to
+    RAS.  The ``flip_xy`` flag is set for such models so that
+    ``_copy_stl_scaled`` negates X and Y of every vertex (and the stored face
+    normal) when writing the output mesh, bringing it into the RAS/ROS frame.
+
+    Parameters
+    ----------
+    mrml_path : str
+        Path to the .mrml XML scene file.  Mesh files are resolved relative
+        to the directory that contains the .mrml file.
+    scale : float
+        Scale factor applied to mesh vertices when copying (default 0.001
+        converts millimetres → metres).
+
+    Returns
+    -------
+    list[dict]  One entry per vtkMRMLModelNode whose mesh file was found:
+        name             – sanitised model name (alphanumeric + underscores)
+        src_stl          – absolute path to the mesh file (STL preferred over VTK)
+        scale            – vertex scale factor
+        flip_xy          – True when the mesh is in LPS and needs X/Y negation
+        xyz              – (x, y, z) position in ROS frame (metres)
+        rpy              – (roll, pitch, yaw) in ROS frame (radians, ZYX convention)
+        color            – (r, g, b, a) display colour, floats 0–1
+    """
+    mrml_path = os.path.abspath(mrml_path)
+    scene_dir = os.path.dirname(mrml_path)
+
+    tree = ET.parse(mrml_path)
+    root = tree.getroot()
+
+    # ── collect all relevant nodes by id ─────────────────────────────────────
+    transforms        = {}   # id -> 4×4 np.ndarray (Slicer RAS, original units)
+    transform_parents = {}   # id -> parent transform id or None
+    model_infos       = {}   # id -> dict
+    storage_files     = {}   # id -> fileName string
+    storage_coord_sys = {}   # id -> coordinateSystem string ('LPS' | 'RAS')
+    display_colors    = {}   # id -> (r, g, b)
+
+    for node in root:
+        nid = node.get('id', '')
+        tag = node.tag
+
+        if tag == 'LinearTransform':
+            mat_str = node.get('matrixTransformToParent', '').strip()
+            if mat_str:
+                vals = [float(v) for v in mat_str.split()]
+                mat = np.array(vals, dtype=float).reshape(4, 4)
+            else:
+                mat = np.eye(4)
+            transforms[nid] = mat
+            transform_parents[nid] = node.get('parentTransformNodeRef') or None
+
+        elif tag == 'Model':
+            refs = node.get('references', '')
+            storage_id = display_id = None
+            for ref in refs.split(';'):
+                ref = ref.strip()
+                if ref.startswith('storage:'):
+                    storage_id = ref[len('storage:'):]
+                elif ref.startswith('display:'):
+                    display_id = ref[len('display:'):]
+            model_infos[nid] = {
+                'name':        node.get('name', nid),
+                'storage_id':  storage_id,
+                'display_id':  display_id,
+                'parent_tf_id': node.get('parentTransformNodeRef') or None,
+            }
+
+        elif tag == 'ModelStorage':
+            storage_files[nid] = node.get('fileName', '')
+            storage_coord_sys[nid] = node.get('coordinateSystem', 'LPS').upper()
+
+        elif tag == 'ModelDisplay':
+            try:
+                c = node.get('color', '0.8 0.2 0.2').split()
+                display_colors[nid] = tuple(float(v) for v in c[:3])
+            except ValueError:
+                display_colors[nid] = (0.8, 0.2, 0.2)
+
+    # ── coordinate conversion ─────────────────────────────────────────────────
+    # SlicerROS2 maps the ROS world frame directly onto Slicer RAS (no axis
+    # flip).  MRML transforms are therefore used as-is in ROS; only the
+    # translation needs to be scaled from mm to metres.
+
+    def world_transform_ras(tf_id, _seen=None):
+        """Recursively compose the full transform chain to the scene root."""
+        if tf_id is None or tf_id not in transforms:
+            return np.eye(4)
+        _seen = _seen or set()
+        if tf_id in _seen:          # cycle guard
+            return np.eye(4)
+        _seen.add(tf_id)
+        parent_id = transform_parents.get(tf_id)
+        return world_transform_ras(parent_id, _seen) @ transforms[tf_id]
+
+    def ras_to_ros(T_ras):
+        """Scale the translation of a Slicer RAS transform from mm to metres.
+
+        SlicerROS2 maps ROS ↔ Slicer RAS with a direct axis correspondence
+        (no flip), so the rotation part is unchanged.
+        """
+        T = T_ras.copy()
+        T[:3, 3] *= scale           # translate scene units (mm) → metres
+        return T
+
+    def mat_to_xyz_rpy(T):
+        """Decompose a 4×4 rigid transform into xyz and ZYX Euler angles."""
+        x, y, z = float(T[0, 3]), float(T[1, 3]), float(T[2, 3])
+        R = T[:3, :3]
+        sin_p = float(np.clip(-R[2, 0], -1.0, 1.0))
+        pitch = math.asin(sin_p)
+        cos_p = math.cos(pitch)
+        if abs(cos_p) > 1e-10:
+            roll = math.atan2(float(R[2, 1]), float(R[2, 2]))
+            yaw  = math.atan2(float(R[1, 0]), float(R[0, 0]))
+        else:
+            roll = 0.0
+            yaw  = math.atan2(float(-R[0, 1]), float(R[1, 1]))
+        return (x, y, z), (roll, pitch, yaw)
+
+    def find_mesh(filename):
+        """Locate the mesh file in the scene directory.
+
+        The MRML storage node may reference a .vtk file while only an STL
+        counterpart exists (or vice versa).  Extensions are tried in order of
+        preference; the exact filename is always attempted last.
+        """
+        base = os.path.splitext(os.path.join(scene_dir, filename))[0]
+        for ext in ('.stl', '.STL', '.obj', '.OBJ', '.vtk', '.VTK', ''):
+            p = base + ext
+            if os.path.isfile(p):
+                return p
+        exact = os.path.join(scene_dir, filename)
+        return exact if os.path.isfile(exact) else None
+
+    def sanitise(name):
+        """Return a ROS/SDF-safe identifier (alphanumeric + underscores)."""
+        return re.sub(r'[^A-Za-z0-9_]', '_', name).strip('_') or 'model'
+
+    # ── build result list ────────────────────────────────────────────────────
+    models = []
+    for nid, info in model_infos.items():
+        stl_path = None
+        if info['storage_id'] and info['storage_id'] in storage_files:
+            stl_path = find_mesh(storage_files[info['storage_id']])
+        if stl_path is None:
+            print(f"  [slicer_scene] Warning: mesh not found for model "
+                  f"'{info['name']}' — skipping.")
+            continue
+
+        T_ras = world_transform_ras(info['parent_tf_id'])
+        T_ros = ras_to_ros(T_ras)
+        xyz, rpy = mat_to_xyz_rpy(T_ros)
+
+        if info['display_id'] and info['display_id'] in display_colors:
+            r, g, b = display_colors[info['display_id']]
+        else:
+            r, g, b = 0.8, 0.2, 0.2
+
+        # Mesh files stored in LPS need X and Y negated to reach RAS = ROS.
+        sid = info['storage_id']
+        coord_sys = storage_coord_sys.get(sid, 'LPS') if sid else 'LPS'
+        flip_xy = (coord_sys == 'LPS')
+
+        models.append({
+            'name':    sanitise(info['name']),
+            'src_stl': stl_path,
+            'scale':   scale,
+            'flip_xy': flip_xy,
+            'xyz':     xyz,
+            'rpy':     rpy,
+            'color':   (r, g, b, 1.0),
+        })
+
+    return models
+
+
 class CatheterGenerator:
     def __init__(self, N, D, L1, L2, L3, K, Kd, Kf, M,
                  package_dir="catheter_package",
                  with_controller=False,
                  anatomy_stl=None, anatomy_xyz=(0, 0, 0), anatomy_rpy=(0, 0, 0),
-                 anatomy_scale=0.001):
+                 anatomy_scale=0.001,
+                 slicer_scene=None, slicer_scale=0.001):
         self.N = N
         self.D = D
         self.L1 = L1
@@ -51,10 +264,37 @@ class CatheterGenerator:
         self.M = M
         self.package_dir = package_dir
         self.with_controller = with_controller
+        # Legacy single-anatomy attributes (kept for API compatibility)
         self.anatomy_stl = anatomy_stl
         self.anatomy_xyz = anatomy_xyz
         self.anatomy_rpy = anatomy_rpy
         self.anatomy_scale = anatomy_scale
+
+        # Unified list of anatomy models (dicts) used by all generation methods.
+        # Entries from --anatomy-stl come first; Slicer scene entries follow.
+        self.anatomy_models = []
+        if anatomy_stl:
+            self.anatomy_models.append({
+                'name':    'anatomy',
+                'src_stl': os.path.abspath(anatomy_stl),
+                'scale':   anatomy_scale,
+                'xyz':     anatomy_xyz,
+                'rpy':     anatomy_rpy,
+                'color':   (0.8, 0.2, 0.2, 0.5),
+            })
+        if slicer_scene:
+            scene_models = parse_slicer_scene(slicer_scene, slicer_scale)
+            existing_names = {m['name'] for m in self.anatomy_models}
+            for sm in scene_models:
+                # Resolve name collisions by appending a numeric suffix
+                base = sm['name']
+                name, n = base, 1
+                while name in existing_names:
+                    n += 1
+                    name = f'{base}_{n}'
+                sm['name'] = name
+                existing_names.add(name)
+            self.anatomy_models.extend(scene_models)
 
         self.meshes_dir = os.path.join(package_dir, "meshes")
         self.urdf_dir   = os.path.join(package_dir, "urdf")
@@ -139,15 +379,22 @@ class CatheterGenerator:
             f.write("endsolid cylinder\n")
         return stl_path
 
-    def _copy_stl_scaled(self, src_path, dst_path, scale):
+    def _copy_stl_scaled(self, src_path, dst_path, scale, flip_xy=False):
         """Copy an STL file with all vertex coordinates multiplied by *scale*.
+
+        If *flip_xy* is True the X and Y coordinates of every vertex — and
+        the X and Y components of the stored face normal — are additionally
+        negated.  This is a 180° rotation about Z and is used to convert
+        meshes from LPS storage convention to the RAS/ROS frame, consistent
+        with how SlicerROS2 maps axes between ROS and Slicer.
 
         Handles both ASCII and binary STL formats.  The output is always
         written as binary STL (more compact and unambiguous).
         """
-        # Detect format: binary STL must not start with "solid " followed by a
-        # valid ASCII preamble, but the safest heuristic is to try ASCII parse
-        # and fall back to binary.
+        sx = -scale if flip_xy else scale
+        sy = -scale if flip_xy else scale
+        sn = -1.0   if flip_xy else 1.0   # normal sign for X and Y
+
         with open(src_path, 'rb') as f:
             raw = f.read()
 
@@ -161,13 +408,15 @@ class CatheterGenerator:
                 for line in lines:
                     if line.strip().lower().startswith('facet normal'):
                         parts = line.strip().split()
-                        normal = (float(parts[2]), float(parts[3]), float(parts[4]))
+                        normal = (float(parts[2]) * sn,
+                                  float(parts[3]) * sn,
+                                  float(parts[4]))
                         next(lines)  # outer loop
                         verts = []
                         for _ in range(3):
                             vline = next(lines).strip().split()
-                            verts.append((float(vline[1]) * scale,
-                                          float(vline[2]) * scale,
+                            verts.append((float(vline[1]) * sx,
+                                          float(vline[2]) * sy,
                                           float(vline[3]) * scale))
                         triangles.append((normal, verts[0], verts[1], verts[2]))
             except (StopIteration, ValueError, IndexError):
@@ -180,10 +429,10 @@ class CatheterGenerator:
             n_tri = struct.unpack_from('<I', raw, 80)[0]
             for _ in range(n_tri):
                 vals = struct.unpack_from('<12f', raw, offset)
-                normal = vals[0:3]
-                v0 = (vals[3] * scale, vals[4] * scale, vals[5] * scale)
-                v1 = (vals[6] * scale, vals[7] * scale, vals[8] * scale)
-                v2 = (vals[9] * scale, vals[10] * scale, vals[11] * scale)
+                normal = (vals[0] * sn, vals[1] * sn, vals[2])
+                v0 = (vals[3] * sx,  vals[4] * sy,  vals[5]  * scale)
+                v1 = (vals[6] * sx,  vals[7] * sy,  vals[8]  * scale)
+                v2 = (vals[9] * sx,  vals[10] * sy, vals[11] * scale)
                 triangles.append((normal, v0, v1, v2))
                 offset += 50  # 12 floats × 4 bytes + 2-byte attribute
 
@@ -619,34 +868,39 @@ ament_package()'''
       <real_time_factor>1.0</real_time_factor>
     </physics>'''
 
-        anatomy_block = ''
-        if self.anatomy_stl:
-            ax, ay, az = self.anatomy_xyz
-            ar, ap, ayaw = self.anatomy_rpy
-            anatomy_block = f'''
-    <!-- Anatomy model: mesh path (__ANATOMY_MESH_PATH__) resolved at launch time -->
+        # One Gazebo model block per anatomy entry; mesh paths use placeholders
+        # resolved at launch time (see generate_launch_file).
+        anatomy_blocks = ''
+        for i, model in enumerate(self.anatomy_models):
+            ax, ay, az = model['xyz']
+            ar, ap, ayaw = model['rpy']
+            mr, mg, mb, ma = model['color']
+            mname = model['name']
+            placeholder = f'__ANATOMY_MESH_PATH_{i}__'
+            anatomy_blocks += f'''
+    <!-- Anatomy model '{mname}': mesh path ({placeholder}) resolved at launch time -->
     <!-- Vertices are pre-scaled to metres by catheter_generator.py -->
-    <model name="anatomy">
+    <model name="{mname}">
       <static>true</static>
       <pose>{ax} {ay} {az} {ar} {ap} {ayaw}</pose>
       <link name="link">
         <visual name="visual">
           <geometry>
             <mesh>
-              <uri>file://__ANATOMY_MESH_PATH__</uri>
+              <uri>file://{placeholder}</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
           <material>
-            <ambient>0.8 0.2 0.2 1</ambient>
-            <diffuse>0.8 0.2 0.2 0.5</diffuse>
+            <ambient>{mr} {mg} {mb} 1</ambient>
+            <diffuse>{mr} {mg} {mb} {ma}</diffuse>
             <specular>0.1 0.1 0.1 1</specular>
           </material>
         </visual>
         <collision name="collision">
           <geometry>
             <mesh>
-              <uri>file://__ANATOMY_MESH_PATH__</uri>
+              <uri>file://{placeholder}</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -709,7 +963,7 @@ ament_package()'''
         </visual>
       </link>
     </model>
-{anatomy_block}
+{anatomy_blocks}
   </world>
 </sdf>'''
 
@@ -741,17 +995,23 @@ ament_package()'''
             '/model/{package_name}_model/pose@geometry_msgs/msg/PoseStamped[gz.msgs.Pose',
             '/world/catheter_world/model/{package_name}_model/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model','''
 
-        # Gazebo launch: OpaqueFunction when anatomy present (path resolved at runtime)
-        if self.anatomy_stl:
-            anatomy_basename = os.path.basename(self.anatomy_stl)
+        # Gazebo launch: always use OpaqueFunction so that anatomy mesh paths
+        # and the world SDF can be resolved at launch time.
+        if self.anatomy_models:
+            replace_lines = '\n'.join(
+                f"        content = content.replace("
+                f"'__ANATOMY_MESH_PATH_{i}__', "
+                f"os.path.join(pkg, 'meshes', '{os.path.basename(m['src_stl'])}'))"
+                for i, m in enumerate(self.anatomy_models)
+            )
             gazebo_block = f'''
     def _launch_gazebo(context):
-        """Resolve installed anatomy mesh path and write a temporary world SDF."""
+        """Resolve installed anatomy mesh paths and write a temporary world SDF."""
         pkg = get_package_share_directory('{package_name}')
-        anatomy_mesh = os.path.join(pkg, 'meshes', '{anatomy_basename}')
-        world_tmpl   = os.path.join(pkg, 'worlds', 'custom_world.sdf')
+        world_tmpl = os.path.join(pkg, 'worlds', 'custom_world.sdf')
         with open(world_tmpl, 'r') as f:
-            content = f.read().replace('__ANATOMY_MESH_PATH__', anatomy_mesh)
+            content = f.read()
+{replace_lines}
         import tempfile
         tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.sdf', delete=False)
         tmp.write(content)
@@ -765,7 +1025,6 @@ ament_package()'''
         )]
 
     gazebo_action = OpaqueFunction(function=_launch_gazebo)'''
-            extra_imports = '\nfrom launch.actions import IncludeLaunchDescription, OpaqueFunction'
         else:
             gazebo_block = f'''
     custom_world_file = os.path.join(pkg_share, 'worlds', 'custom_world.sdf')
@@ -775,34 +1034,63 @@ ament_package()'''
         ),
         launch_arguments={{'gz_args': f'-r {{custom_world_file}}'}}.items(),
     )'''
-            extra_imports = '\nfrom launch.actions import IncludeLaunchDescription'
 
         launch_content = f'''import os
 
 from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription{extra_imports}
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import xacro
 
 
 def generate_launch_description():
 
-    pkg_share     = get_package_share_directory('{package_name}')
+    pkg_share      = get_package_share_directory('{package_name}')
     pkg_ros_gz_sim = get_package_share_directory('ros_gz_sim')
 
-    robot_description_file   = os.path.join(pkg_share, 'urdf', '{xacro_filename}')
-    robot_description_config = xacro.process_file(robot_description_file)
-    robot_description = {{'robot_description': robot_description_config.toxml()}}
+    robot_description_file = os.path.join(pkg_share, 'urdf', '{xacro_filename}')
 
-    # Publishes TF for the catheter and the anatomy model (when configured)
-    robot_state_publisher = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='both',
-        parameters=[robot_description],
-    )
+    # ── Initial catheter pose ────────────────────────────────────────────────
+    # Override at launch time:
+    #   ros2 launch {package_name} {package_name}_launch.py initial_z:=0.3
+    pose_args = [
+        DeclareLaunchArgument('initial_x',     default_value='0.0',
+                              description='Catheter initial X position (m)'),
+        DeclareLaunchArgument('initial_y',     default_value='0.0',
+                              description='Catheter initial Y position (m)'),
+        DeclareLaunchArgument('initial_z',     default_value='0.0',
+                              description='Catheter initial Z position (m)'),
+        DeclareLaunchArgument('initial_roll',  default_value='0.0',
+                              description='Catheter initial roll  (rad)'),
+        DeclareLaunchArgument('initial_pitch', default_value='0.0',
+                              description='Catheter initial pitch (rad)'),
+        DeclareLaunchArgument('initial_yaw',   default_value='0.0',
+                              description='Catheter initial yaw   (rad)'),
+    ]
+
+    def _robot_state_publisher(context):
+        """Process Xacro with the launch-time initial pose and start RSP."""
+        mappings = {{
+            'initial_x':     LaunchConfiguration('initial_x').perform(context),
+            'initial_y':     LaunchConfiguration('initial_y').perform(context),
+            'initial_z':     LaunchConfiguration('initial_z').perform(context),
+            'initial_roll':  LaunchConfiguration('initial_roll').perform(context),
+            'initial_pitch': LaunchConfiguration('initial_pitch').perform(context),
+            'initial_yaw':   LaunchConfiguration('initial_yaw').perform(context),
+        }}
+        config = xacro.process_file(robot_description_file, mappings=mappings)
+        return [Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            output='both',
+            parameters=[{{'robot_description': config.toxml()}}],
+        )]
+
+    rsp_action = OpaqueFunction(function=_robot_state_publisher)
 
     rviz = Node(
         package='rviz2',
@@ -814,8 +1102,16 @@ def generate_launch_description():
     spawn = Node(
         package='ros_gz_sim',
         executable='create',
-        parameters=[{{'name': '{package_name}_model',
-                    'file': os.path.join(pkg_share, 'sdf', '{sdf_filename}')}}],
+        parameters=[{{
+            'name':  '{package_name}_model',
+            'file':  os.path.join(pkg_share, 'sdf', '{sdf_filename}'),
+            'x':     LaunchConfiguration('initial_x'),
+            'y':     LaunchConfiguration('initial_y'),
+            'z':     LaunchConfiguration('initial_z'),
+            'roll':  LaunchConfiguration('initial_roll'),
+            'pitch': LaunchConfiguration('initial_pitch'),
+            'yaw':   LaunchConfiguration('initial_yaw'),
+        }}],
         output='screen',
     )
 
@@ -833,10 +1129,11 @@ def generate_launch_description():
 {gazebo_block}
 
     return LaunchDescription([
+        *pose_args,
         gazebo_action,
         spawn,
         bridge,
-        robot_state_publisher,
+        rsp_action,
         rviz,
     ])
 '''
@@ -932,6 +1229,14 @@ def generate_launch_description():
         robot = ET.Element('robot', name='flexible_catheter')
         robot.set('xmlns:xacro', 'http://www.ros.org/wiki/xacro')
 
+        # Initial-pose arguments — settable at launch time via xacro mappings.
+        # Passive mode uses them in the world_to_base fixed joint.
+        # Controller mode declares them for consistency but the prismatic joints
+        # control position instead; use the Gazebo spawn pose for offset.
+        for arg in ('initial_x', 'initial_y', 'initial_z',
+                    'initial_roll', 'initial_pitch', 'initial_yaw'):
+            ET.SubElement(robot, 'xacro:arg', name=arg, default='0.0')
+
         self.generate_cylinder_stl(self.radius, self.L3,                   'tip_link.stl')
         self.generate_cylinder_stl(self.radius, self.L1,                   'base_link.stl')
         self.generate_cylinder_stl(self.radius, self.bending_link_length,  'bending_link.stl')
@@ -1005,7 +1310,9 @@ def generate_launch_description():
             j_world = ET.SubElement(robot, 'joint', name='world_to_base', type='fixed')
             ET.SubElement(j_world, 'parent', link='world')
             ET.SubElement(j_world, 'child',  link='base_link')
-            ET.SubElement(j_world, 'origin', xyz='0 0 0', rpy='0 0 0')
+            ET.SubElement(j_world, 'origin',
+                          xyz='$(arg initial_x) $(arg initial_y) $(arg initial_z)',
+                          rpy='$(arg initial_roll) $(arg initial_pitch) $(arg initial_yaw)')
 
         # Flexible catheter joints
         if self.bending_links > 0:
@@ -1028,24 +1335,29 @@ def generate_launch_description():
                           name='base_to_tip', parent='base_link', child='tip_link',
                           xyz_origin=f'0 0 {self.L1}', spring_k='${spring_constant}')
 
-        # Anatomy link — fixed to world frame, visible in both RViz and Gazebo
-        if self.anatomy_stl:
-            anatomy_basename = os.path.basename(self.anatomy_stl)
-            al = ET.SubElement(robot, 'link', name='anatomy_link')
+        # Anatomy links — each fixed to the world frame, visible in RViz.
+        for model in self.anatomy_models:
+            mname = model['name']
+            stl_basename = os.path.basename(model['src_stl'])
+            mr, mg, mb, ma = model['color']
+            ax, ay, az = model['xyz']
+            ar, ap, ayaw = model['rpy']
+
+            al = ET.SubElement(robot, 'link', name=f'anatomy_link_{mname}')
             vis = ET.SubElement(al, 'visual')
             ET.SubElement(vis, 'origin', xyz='0 0 0', rpy='0 0 0')
             mesh_el = ET.SubElement(ET.SubElement(vis, 'geometry'), 'mesh')
-            mesh_el.set('filename', f'package://{package_name}/meshes/{anatomy_basename}')
+            mesh_el.set('filename', f'package://{package_name}/meshes/{stl_basename}')
             mesh_el.set('scale', '1 1 1')
-            amat = ET.SubElement(vis, 'material', name='anatomy_material')
-            ET.SubElement(amat, 'color', rgba='0.8 0.2 0.2 0.5')
+            amat = ET.SubElement(vis, 'material', name=f'anatomy_material_{mname}')
+            ET.SubElement(amat, 'color', rgba=f'{mr} {mg} {mb} {ma}')
 
-            ja = ET.SubElement(robot, 'joint', name='world_to_anatomy', type='fixed')
+            ja = ET.SubElement(robot, 'joint', name=f'world_to_anatomy_{mname}', type='fixed')
             ET.SubElement(ja, 'parent', link='world')
-            ET.SubElement(ja, 'child',  link='anatomy_link')
+            ET.SubElement(ja, 'child',  link=f'anatomy_link_{mname}')
             ET.SubElement(ja, 'origin',
-                          xyz=f'{self.anatomy_xyz[0]} {self.anatomy_xyz[1]} {self.anatomy_xyz[2]}',
-                          rpy=f'{self.anatomy_rpy[0]} {self.anatomy_rpy[1]} {self.anatomy_rpy[2]}')
+                          xyz=f'{ax} {ay} {az}',
+                          rpy=f'{ar} {ap} {ayaw}')
 
         return robot
 
@@ -1237,11 +1549,12 @@ if __name__ == \'__main__\':
         pkg_xml_path = self.generate_package_xml()
         cmake_path   = self.generate_cmakelists_txt()
 
-        if self.anatomy_stl:
+        for model in self.anatomy_models:
             self._copy_stl_scaled(
-                self.anatomy_stl,
-                os.path.join(self.meshes_dir, os.path.basename(self.anatomy_stl)),
-                self.anatomy_scale,
+                model['src_stl'],
+                os.path.join(self.meshes_dir, os.path.basename(model['src_stl'])),
+                model['scale'],
+                flip_xy=model.get('flip_xy', False),
             )
 
         sdf_path    = self.generate_sdf(filename)
@@ -1263,10 +1576,9 @@ if __name__ == \'__main__\':
         print(f"  {rel(launch_path)}")
         if teleop_path:
             print(f"  {rel(teleop_path)}")
-        print(f"  meshes/  (tip_link, bending_link, base_link", end='')
-        if self.anatomy_stl:
-            print(f", {os.path.basename(self.anatomy_stl)}", end='')
-        print(")")
+        anatomy_mesh_names = [os.path.basename(m['src_stl']) for m in self.anatomy_models]
+        extras = (', ' + ', '.join(anatomy_mesh_names)) if anatomy_mesh_names else ''
+        print(f"  meshes/  (tip_link, bending_link, base_link{extras})")
 
 
 def main():
@@ -1292,9 +1604,9 @@ def main():
     # Mode
     parser.add_argument("--controller", action="store_true",
                         help="Generate 4-DOF motorized base with keyboard teleoperation")
-    # Anatomy
+    # Single anatomy STL (legacy / simple use-case)
     parser.add_argument("--anatomy-stl",   type=str,   default=None,
-                        help="Path to anatomy STL file (visible in both RViz and Gazebo)")
+                        help="Path to a single anatomy STL file (visible in both RViz and Gazebo)")
     parser.add_argument("--anatomy-x",     type=float, default=0.0,   help="Anatomy X position (m)")
     parser.add_argument("--anatomy-y",     type=float, default=0.0,   help="Anatomy Y position (m)")
     parser.add_argument("--anatomy-z",     type=float, default=0.0,   help="Anatomy Z position (m)")
@@ -1302,7 +1614,17 @@ def main():
     parser.add_argument("--anatomy-pitch", type=float, default=0.0,   help="Anatomy pitch (rad)")
     parser.add_argument("--anatomy-yaw",   type=float, default=0.0,   help="Anatomy yaw   (rad)")
     parser.add_argument("--anatomy-scale", type=float, default=0.001,
-                        help="Mesh scale factor (default 0.001 converts mm→m)")
+                        help="Mesh scale factor for --anatomy-stl (default 0.001 converts mm→m)")
+    # 3D Slicer MRML scene (multiple anatomy models with transforms)
+    parser.add_argument("--slicer-scene", type=str, default=None,
+                        help="Path to a 3D Slicer MRML scene file (.mrml). "
+                             "All vtkMRMLModelNode entries are imported with their "
+                             "linear transforms applied. "
+                             "LPS-stored meshes (DICOM default) have X and Y negated "
+                             "automatically to match the RAS/ROS frame used by SlicerROS2.")
+    parser.add_argument("--slicer-scale", type=float, default=0.001,
+                        help="Mesh scale factor for --slicer-scene models "
+                             "(default 0.001 converts mm→m)")
 
     args = parser.parse_args()
 
@@ -1316,6 +1638,8 @@ def main():
             anatomy_xyz=(args.anatomy_x, args.anatomy_y, args.anatomy_z),
             anatomy_rpy=(args.anatomy_roll, args.anatomy_pitch, args.anatomy_yaw),
             anatomy_scale=args.anatomy_scale,
+            slicer_scene=args.slicer_scene,
+            slicer_scale=args.slicer_scale,
         )
         gen.save(args.xacro_name)
     except ValueError as e:
