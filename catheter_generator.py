@@ -302,6 +302,7 @@ class CatheterGenerator:
         self.launch_dir = os.path.join(package_dir, "launch")
         self.worlds_dir = os.path.join(package_dir, "worlds")
         self.scripts_dir = os.path.join(package_dir, "scripts")
+        self.config_dir  = os.path.join(package_dir, "config")
 
         self.validate_parameters()
         self.calculate_derived_values()
@@ -331,7 +332,7 @@ class CatheterGenerator:
 
     def create_package_structure(self):
         for d in [self.package_dir, self.meshes_dir, self.urdf_dir,
-                  self.sdf_dir, self.launch_dir, self.worlds_dir]:
+                  self.sdf_dir, self.launch_dir, self.worlds_dir, self.config_dir]:
             os.makedirs(d, exist_ok=True)
         if self.with_controller:
             os.makedirs(self.scripts_dir, exist_ok=True)
@@ -523,6 +524,10 @@ install(DIRECTORY launch/
   DESTINATION share/${{PROJECT_NAME}}/launch/
   FILES_MATCHING PATTERN "*.py"
   PATTERN "*.launch.py"
+)
+
+install(DIRECTORY config/
+  DESTINATION share/${{PROJECT_NAME}}/config/
 ){scripts_block}
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -1035,11 +1040,53 @@ ament_package()'''
         launch_arguments={{'gz_args': f'-r {{custom_world_file}}'}}.items(),
     )'''
 
+        # Passive mode: static_transform_publisher starts after RSP (via
+        # OnProcessStart) and publishes world → base_link at the initial pose.
+        # Because it publishes to /tf_static AFTER RSP's world_to_base (which is
+        # fixed at origin in the URDF), it wins in the tf2 transient-local cache
+        # so RViz always shows the catheter at the correct initial position.
+        if not self.with_controller:
+            initial_pose_tf_block = f'''
+    # ── Initial pose: world → base_link static TF ───────────────────────────
+    # Published after RSP so it overrides the URDF's world_to_base (at origin).
+    initial_pose_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='catheter_initial_pose_broadcaster',
+        arguments=[
+            '--x',     LaunchConfiguration('initial_x'),
+            '--y',     LaunchConfiguration('initial_y'),
+            '--z',     LaunchConfiguration('initial_z'),
+            '--roll',  LaunchConfiguration('initial_roll'),
+            '--pitch', LaunchConfiguration('initial_pitch'),
+            '--yaw',   LaunchConfiguration('initial_yaw'),
+            '--frame-id',       'world',
+            '--child-frame-id', 'base_link',
+        ],
+    )
+    start_initial_pose_tf = RegisterEventHandler(
+        OnProcessStart(target_action=rsp_node, on_start=[initial_pose_tf])
+    )
+'''
+            ld_initial_pose_entry = '        start_initial_pose_tf,'
+        else:
+            initial_pose_tf_block = ''
+            ld_initial_pose_entry = ''
+
+        event_handler_imports = (
+            'from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,\n'
+            '                             OpaqueFunction, RegisterEventHandler)\n'
+            'from launch.event_handlers import OnProcessStart'
+            if not self.with_controller else
+            'from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,\n'
+            '                             OpaqueFunction)'
+        )
+
         launch_content = f'''import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+{event_handler_imports}
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -1050,8 +1097,6 @@ def generate_launch_description():
 
     pkg_share      = get_package_share_directory('{package_name}')
     pkg_ros_gz_sim = get_package_share_directory('ros_gz_sim')
-
-    robot_description_file = os.path.join(pkg_share, 'urdf', '{xacro_filename}')
 
     # ── Initial catheter pose ────────────────────────────────────────────────
     # Override at launch time:
@@ -1071,32 +1116,28 @@ def generate_launch_description():
                               description='Catheter initial yaw   (rad)'),
     ]
 
-    def _robot_state_publisher(context):
-        """Process Xacro with the launch-time initial pose and start RSP."""
-        mappings = {{
-            'initial_x':     LaunchConfiguration('initial_x').perform(context),
-            'initial_y':     LaunchConfiguration('initial_y').perform(context),
-            'initial_z':     LaunchConfiguration('initial_z').perform(context),
-            'initial_roll':  LaunchConfiguration('initial_roll').perform(context),
-            'initial_pitch': LaunchConfiguration('initial_pitch').perform(context),
-            'initial_yaw':   LaunchConfiguration('initial_yaw').perform(context),
-        }}
-        config = xacro.process_file(robot_description_file, mappings=mappings)
-        return [Node(
-            package='robot_state_publisher',
-            executable='robot_state_publisher',
-            name='robot_state_publisher',
-            output='both',
-            parameters=[{{'robot_description': config.toxml()}}],
-        )]
-
-    rsp_action = OpaqueFunction(function=_robot_state_publisher)
-
+    # ── robot_state_publisher ────────────────────────────────────────────────
+    # Process the xacro once at launch-description time.  The initial pose is
+    # NOT baked into the URDF here; it is applied by static_transform_publisher
+    # (passive mode) or by the Gazebo spawn pose (controller mode).
+    config = xacro.process_file(
+        os.path.join(pkg_share, 'urdf', '{xacro_filename}')
+    )
+    rsp_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='both',
+        parameters=[{{'robot_description': config.toxml()}}],
+    )
+{initial_pose_tf_block}
+    rviz_config = os.path.join(pkg_share, 'config', 'rviz_config.rviz')
     rviz = Node(
         package='rviz2',
         executable='rviz2',
         name='rviz2',
         output='screen',
+        arguments=['-d', rviz_config],
     )
 
     spawn = Node(
@@ -1133,13 +1174,62 @@ def generate_launch_description():
         gazebo_action,
         spawn,
         bridge,
-        rsp_action,
+        rsp_node,
+{ld_initial_pose_entry}
         rviz,
     ])
 '''
         path = os.path.join(self.launch_dir, f"{package_name}_launch.py")
         with open(path, 'w') as f:
             f.write(launch_content)
+        return path
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RViz config
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def generate_rviz_config(self):
+        """Write a minimal RViz2 config that sets the fixed frame to 'world'."""
+        content = '''\
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/RobotModel
+      Description Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Enabled: true
+      Name: RobotModel
+      Value: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 1.5
+      Name: Current View
+      Pitch: 0.4
+      Yaw: 0.8
+Window Geometry:
+  Hide Left Dock: false
+  Hide Right Dock: true
+'''
+        path = os.path.join(self.config_dir, 'rviz_config.rviz')
+        with open(path, 'w') as f:
+            f.write(content)
         return path
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1229,13 +1319,9 @@ def generate_launch_description():
         robot = ET.Element('robot', name='flexible_catheter')
         robot.set('xmlns:xacro', 'http://www.ros.org/wiki/xacro')
 
-        # Initial-pose arguments — settable at launch time via xacro mappings.
-        # Passive mode uses them in the world_to_base fixed joint.
-        # Controller mode declares them for consistency but the prismatic joints
-        # control position instead; use the Gazebo spawn pose for offset.
-        for arg in ('initial_x', 'initial_y', 'initial_z',
-                    'initial_roll', 'initial_pitch', 'initial_yaw'):
-            ET.SubElement(robot, 'xacro:arg', name=arg, default='0.0')
+        # Note: initial catheter pose is handled at launch time via a
+        # static_transform_publisher (passive mode) or Gazebo spawn position
+        # (controller mode), not via xacro args.
 
         self.generate_cylinder_stl(self.radius, self.L3,                   'tip_link.stl')
         self.generate_cylinder_stl(self.radius, self.L1,                   'base_link.stl')
@@ -1307,12 +1393,13 @@ def generate_launch_description():
             ET.SubElement(j_rot, 'dynamics',
                           damping=str(self.damping), friction=str(self.friction))
         else:
+            # Passive: base_link is anchored to the world frame at the origin.
+            # The actual initial pose offset is applied by a static_transform_publisher
+            # launched alongside robot_state_publisher (see generate_launch_file).
             j_world = ET.SubElement(robot, 'joint', name='world_to_base', type='fixed')
             ET.SubElement(j_world, 'parent', link='world')
             ET.SubElement(j_world, 'child',  link='base_link')
-            ET.SubElement(j_world, 'origin',
-                          xyz='$(arg initial_x) $(arg initial_y) $(arg initial_z)',
-                          rpy='$(arg initial_roll) $(arg initial_pitch) $(arg initial_yaw)')
+            ET.SubElement(j_world, 'origin', xyz='0 0 0', rpy='0 0 0')
 
         # Flexible catheter joints
         if self.bending_links > 0:
@@ -1560,6 +1647,7 @@ if __name__ == \'__main__\':
         sdf_path    = self.generate_sdf(filename)
         launch_path = self.generate_launch_file(filename)
         world_path  = self.generate_custom_world()
+        rviz_path   = self.generate_rviz_config()
 
         teleop_path = None
         if self.with_controller:
@@ -1574,6 +1662,7 @@ if __name__ == \'__main__\':
         print(f"  {rel(sdf_path)}")
         print(f"  {rel(world_path)}")
         print(f"  {rel(launch_path)}")
+        print(f"  {rel(rviz_path)}")
         if teleop_path:
             print(f"  {rel(teleop_path)}")
         anatomy_mesh_names = [os.path.basename(m['src_stl']) for m in self.anatomy_models]
